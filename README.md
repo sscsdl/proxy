@@ -2,18 +2,23 @@
 
 ## Build构建二进制文件
 
-- 编译当前系统环境的二级制文件
-    ```go
+- 编译当前系统环境的二进制文件
+    ```shell
+    go build main.go
+    ```
+- 在windows 64编译32位
+    ```shell
+    SET GOARCH=386
     go build main.go
     ```
 
 - 在windows编译linux环境的二进制文件
-    ```go
-    SET CGO_ENABLED=0
-    SET GOOS=linux
-    SET GOARCH=amd64
-    go build main.go
-    ```
+```shell
+SET CGO_ENABLED=0
+SET GOOS=linux
+SET GOARCH=amd64
+go build main.go
+```
 
 - 或直接使用已编译好的二进制文件
     - Linux: `main-linux`

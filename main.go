@@ -1,35 +1,30 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
-	"net"
-	// "net/http"
-	// "net/url"
-	"bufio"
-	"os"
-	"io"
-	// "io/ioutil"
-	// "sync"
-	"time"
-	// "strings"
-	// "bytes"
 	"github.com/sscsdl/proxy/pipe"
 	"github.com/sscsdl/proxy/proxy"
+	"io"
+	"net"
+	"os"
+	"time"
 )
 
 var (
 	// quit = make(chan bool, 1)
 	isDebug = flag.Bool("debug", false, "debug")
-	model = flag.Int("model", 0, "0: normal proxy\n1: master-passive\n2: slave-aActive")
+	model   = flag.Int("model", 0, "0: normal proxy\n1: master-passive\n2: slave-aActive")
 	connNum = make(chan int, 100)
-	
+
 	// slaveActive
 	keepConnNum = flag.Int("k", 10, "keep number of conncet")
 	block       = flag.Bool("block", true, "block file")
 	exit        = make(chan int, 1)
-	ip 			= flag.String("ip", "", "master proxy")
-	proxyServer proxy.Proxy
+	port        = flag.String("port", "9010", "port")
+	ip          = flag.String("ip", "", "master proxy")
+	proxyServer *proxy.Proxy
 )
 
 func debug(args ...interface{}) {
@@ -50,7 +45,7 @@ func main() {
 		// master-passive
 		masterPassive()
 	case 2:
-		// slave-aActive
+		// slave-active
 		slaveActive()
 	}
 }
@@ -60,14 +55,14 @@ func normal() {
 		go proxyStat()
 	}
 
-	proxyServer := proxy.NewPorxy("9010")
+	proxyServer = proxy.NewPorxy(*port)
 	proxyServer.Debug = *isDebug
-	
+
 	// 设置禁止访问域名
 	if *block {
 		proxyServer.SetBlockList(loadBlockFile())
 	}
-	
+
 	proxyServer.ListenAndAccept(proxyServer.HandleConnection)
 }
 
@@ -76,21 +71,23 @@ func masterPassive() {
 		go stat()
 	}
 
-	proxyServer := proxy.NewPorxy("9010")
+	proxyServer = proxy.NewPorxy(*port)
 	proxyServer.Debug = *isDebug
 	proxyServer.Listen()
 
 	pipeServer := pipe.NewPipe()
 	pipeServer.Debug = *isDebug
 	pipeServer.Listen()
-	
+
 	for {
 		pipeConn := pipeServer.Accept()
 		reqConn := proxyServer.Accept()
 		debug(reqConn.RemoteAddr(), "<=>", pipeConn.RemoteAddr())
 		go func() {
 			defer func() {
-				<- connNum
+				<-connNum
+				reqConn.Close()
+				pipeConn.Close()
 			}()
 			connNum <- 1
 			proxyServer.Docking(reqConn, pipeConn)
@@ -111,7 +108,7 @@ func slaveActive() {
 	pipeServer := pipe.NewPipe()
 	pipeServer.Debug = *isDebug
 
-	proxyServer := proxy.NewPorxy("9010")
+	proxyServer = proxy.NewPorxy(*port)
 	proxyServer.Debug = *isDebug
 	// 设置禁止访问域名
 	if *block {
@@ -140,7 +137,7 @@ func handleReq(proxyServer *proxy.Proxy, pipeConn net.Conn) {
 		<-connNum
 	}()
 	connNum <- 1
-	
+
 	proxyServer.HandleConnection(pipeConn)
 }
 

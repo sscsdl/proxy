@@ -7,12 +7,12 @@ import (
 	"net/url"
 	// "bufio"
 	// "os"
+	"bytes"
 	"io"
+	"strings"
 	// "io/ioutil"
 	"sync"
 	"time"
-	"strings"
-	// "bytes"
 	// "connpipe"
 )
 
@@ -24,31 +24,31 @@ const (
 // NewPorxy create a new proxy
 func NewPorxy(port string) *Proxy {
 	return &Proxy{
-		port: port,
-		connNum: make(chan int, 100),
-		eventCallback: make(map[int] Callback, 1),
-		event: make(chan Event, 100),
+		port:          port,
+		connNum:       make(chan int, 100),
+		eventCallback: make(map[int]Callback, 1),
+		event:         make(chan Event, 100),
 	}
 }
 
 // Callback type
-type Callback func (conn net.Conn)
+type Callback func(conn net.Conn)
 
 // Event type
 type Event struct {
-	no int
+	no   int
 	conn net.Conn
 }
 
 // Proxy struct
 type Proxy struct {
-	Debug bool
-	port string
+	Debug   bool
+	port    string
 	connNum chan int
-	ln net.Listener
+	ln      net.Listener
 	// 事件
-	event chan Event
-	eventCallback map[int] Callback
+	event         chan Event
+	eventCallback map[int]Callback
 	blockHostList map[string]bool
 }
 
@@ -60,8 +60,8 @@ func (p *Proxy) ListenAndAccept(callback Callback) {
 		go func() {
 			defer func() {
 				p.debug("callback end")
-				<- p.connNum
-				conn.Close()
+				<-p.connNum
+				_ = conn.Close()
 			}()
 			p.connNum <- 1
 			callback(conn)
@@ -73,7 +73,7 @@ func (p *Proxy) ListenAndAccept(callback Callback) {
 func (p *Proxy) Listen() {
 	p.debug("Listen:", p.port)
 	var err error
-	p.ln, err = net.Listen("tcp", ":" + p.port)
+	p.ln, err = net.Listen("tcp", ":"+p.port)
 	if err != nil {
 		panic(err)
 	}
@@ -101,35 +101,29 @@ func (p *Proxy) HandleConnection(conn net.Conn) {
 	)
 
 	defer func() {
-		p.debug("close back connect", conn.LocalAddr())
+		p.debugConn(conn, "close")
+		_ = conn.Close()
 	}()
-	
+
 	reqBody, err := p.getRequest(conn)
 	// 产生数据第一次传输事件
 	p.event <- Event{no: EventFirstdata, conn: conn}
 	if err != nil {
-		p.debug("getRequest nil", err)
+		p.debugConn(conn, "getRequest nil", err)
 		return
 	}
 	// 解析请求
-	req = parseReq(string(reqBody))
-	// p.debug(req)
-	addrArr := strings.Split(conn.LocalAddr().String(), ":")
-	req.proxyConnPort = addrArr[1]
-
-	defer func() {
-		p.debug(req.proxyConnPort, "close back connect", req.hostname + ":" + req.port)
-	}()
+	req = parseReq(reqBody)
 
 	// 拦截请求
 	if block := p.blockReq(req.hostname); block {
 		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-		p.debug(req.proxyConnPort, "block:", req.hostname)
+		p.debugConn(conn, req.proxyConnPort, "block:", req.hostname)
 		return
 	}
-	p.debug("request:", req.method, req.url)
-	
-	if "CONNECT" == req.method {
+	p.debugConn(conn, "request:", req.method, req.url)
+
+	if "CONNECT" == req.method || req.https {
 		p.httpsHandle(req, conn)
 	} else {
 		p.httpHandle(req, conn, reqBody)
@@ -152,15 +146,15 @@ func (p *Proxy) SetBlockList(blockHostList map[string]bool) {
 
 // handle http request
 func (p *Proxy) httpHandle(req *Req, srcConn net.Conn, reqBody []byte) {
-	dstConn, err := net.Dial("tcp", req.hostname + ":" + req.port)
+	dstConn, err := net.Dial("tcp", req.hostname+":"+req.port)
 	if err != nil {
-		p.debug(req.proxyConnPort, "connect http err:", err)
+		p.debugConn(srcConn, "connect http err:", err)
 		return
 	}
 	defer dstConn.Close()
 	_, err = dstConn.Write(reqBody)
 	if err != nil {
-		p.debug(req.proxyConnPort, "sent to http err:", err)
+		p.debugConn(srcConn, "sent to http err:", err)
 		return
 	}
 	p.Docking(srcConn, dstConn)
@@ -170,13 +164,13 @@ func (p *Proxy) httpHandle(req *Req, srcConn net.Conn, reqBody []byte) {
 func (p *Proxy) httpsHandle(req *Req, srcConn net.Conn) {
 	dstConn, err := net.Dial("tcp", req.url)
 	if err != nil {
-		p.debug(req.proxyConnPort, "connect https err:", err)
+		p.debugConn(srcConn, "connect https err:", err)
 		return
 	}
 	defer dstConn.Close()
 	_, err = srcConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 	if err != nil {
-		p.debug(req.proxyConnPort, "sent to https err:", err)
+		p.debugConn(srcConn, "sent to https err:", err)
 		return
 	}
 	p.Docking(srcConn, dstConn)
@@ -185,14 +179,12 @@ func (p *Proxy) httpsHandle(req *Req, srcConn net.Conn) {
 // Docking transfer connect
 func (p *Proxy) Docking(src net.Conn, dst net.Conn) {
 	defer func() {
-		p.debug("close docking", src.RemoteAddr())
-		src.Close()
-		dst.Close()
+		p.debugConn(src, "close docking")
 		// <- connNum
 	}()
 	var (
-		wg sync.WaitGroup
-		closeFlag bool = false
+		wg        sync.WaitGroup
+		closeFlag = false
 	)
 	wg.Add(2)
 	go p.transfer(src, dst, &wg, &closeFlag, "send")
@@ -202,43 +194,64 @@ func (p *Proxy) Docking(src net.Conn, dst net.Conn) {
 
 func (p *Proxy) transfer(from net.Conn, sentto net.Conn, wg *sync.WaitGroup, closeFlag *bool, way string) {
 	defer wg.Done()
-	
+
 	buf := make([]byte, 4096)
 	for {
 		if *closeFlag {
 			break
 		}
-		from.SetReadDeadline(time.Now().Add(30 * time.Second))
+		_ = from.SetReadDeadline(time.Now().Add(30 * time.Second))
 		n, err := from.Read(buf)
-		// p.debug(way, "copy", n)
+		if err == io.EOF {
+			if way == "send" {
+				p.debugConn(from, "=> io.EOF")
+			} else {
+				p.debugConn(sentto, "<= io.EOF")
+			}
+			break
+		} else if err != nil {
+			if nerr, ok := err.(net.Error); ok && (nerr.Timeout() || nerr.Temporary()) {
+				if way == "send" {
+					p.debugConn(from, "=> net err", nerr)
+				} else {
+					p.debugConn(sentto, "<= net err", nerr)
+				}
+				continue
+			}
+			if way == "send" {
+				p.debugConn(from, "=> err", err)
+			} else {
+				p.debugConn(sentto, "<= err", err)
+			}
+			break
+		}
 		if n > 0 {
+			// fmt.Println(string(buf[:n]))
 			_, err := sentto.Write(buf[:n])
 			if err != nil {
-				p.debug(way, "Write err", err)
+				if way == "send" {
+					p.debugConn(from, "=> write err")
+				} else {
+					p.debugConn(sentto, "<= write err")
+				}
 				break
 			}
 		}
-		if err == io.EOF {
-			p.debug(way, "io.EOF")
-			break
-		} else if err != nil {
-			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-                continue
-            }
-			// *closeFlag = true
-			p.debug(way, "err", err)
-			break
+		if way == "send" {
+			p.debugConn(from, "=> n==0")
+		} else {
+			p.debugConn(sentto, "<= n==0")
 		}
 	}
-	sentto.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = sentto.SetReadDeadline(time.Now().Add(5 * time.Second))
 	*closeFlag = true
-	return 
+	return
 }
 
 func (p *Proxy) eventHandleServer() {
 	var event Event
 	for {
-		event = <- p.event
+		event = <-p.event
 		// if callback, ok := p.eventCallback[event.no]; ok {
 		go p.eventCallback[event.no](event.conn)
 		// }
@@ -257,16 +270,16 @@ func (p *Proxy) ListenEvent(event int, callback Callback) error {
 
 func (p *Proxy) getRequest(from net.Conn) ([]byte, error) {
 	var (
-		result = []byte{}
-		firstRead bool = true
+		result    []byte
+		firstRead = true
 	)
 	buf := make([]byte, 2048)
 	for {
 		if firstRead {
-			from.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_ = from.SetReadDeadline(time.Now().Add(5 * time.Second))
 			firstRead = false
 		} else {
-			from.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			_ = from.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 		}
 		n, err := from.Read(buf)
 		if err == io.EOF {
@@ -307,39 +320,72 @@ func (p *Proxy) debug(args ...interface{}) {
 		fmt.Println(args...)
 	}
 }
+func (p *Proxy) debugConn(conn net.Conn, args ...interface{}) {
+	if p.Debug {
+		localAddr := conn.LocalAddr().String()
+		index := strings.LastIndex(localAddr, ":")
+		localPort := localAddr[index+1:]
+		fmt.Printf("proxy[%s] ", localPort)
+		fmt.Println(args...)
+	}
+}
 
 // Req type
 type Req struct {
-	method string
-	hostname string
-	port string
-	url string
-	body string
+	method        string
+	hostname      string
+	port          string
+	url           string
+	body          []byte
 	proxyConnPort string
+	https         bool
 }
 
-func parseReq(result string) (req *Req) {
+func parseReq(result []byte) (req *Req) {
 	req = &Req{}
-	lineArr := strings.Split(result, "\r\n")
-	// this.debug("parseReq:", lineArr[0])
-	
-	firstLineArr := strings.Split(lineArr[0], " ")
-	req.method = firstLineArr[0]
-	req.url = firstLineArr[1]
+	index := bytes.Index(result, []byte{'\n'})
+	if index == -1 {
+		fmt.Println(string(result))
+		panic("parseReq err 1")
+	}
+	firstLine := result[:index]
 	req.body = result
-	// this.debug(req.method, req.url)
+	var ok bool
+	req.method, req.url, ok = parseRequestLine(firstLine)
+	if !ok {
+		fmt.Println(string(result))
+		fmt.Printf("%x", result)
+		panic("parseReq err 2")
+	}
 	if "CONNECT" == req.method {
-		httpsURL := strings.Split(firstLineArr[1], ":")
-		req.hostname, req.port = httpsURL[0], httpsURL[1]
-		return
+		index = bytes.Index(firstLine, []byte{':'})
+		req.hostname, req.port = string(firstLine[:index]), string(firstLine[index+1:])
+		req.https = true
+	} else {
+		urlObj, err := url.Parse(req.url)
+		if err != nil {
+			fmt.Println(string(firstLine))
+			fmt.Println(req.url)
+			panic(err)
+		}
+		if urlObj.Scheme == "https" {
+			req.https = true
+		}
+		req.hostname, req.port = urlObj.Hostname(), urlObj.Port()
 	}
-	urlObj, err := url.Parse(req.url)
-	if err != nil {
-		panic("err")
-	}
-	req.hostname, req.port = urlObj.Hostname(), urlObj.Port()
 	if "" == req.port {
 		req.port = "80"
 	}
 	return
+}
+
+// parseRequestLine parses "GET /foo HTTP/1.1" into its three parts.
+func parseRequestLine(line []byte) (method, requestURI string, ok bool) {
+	s1 := bytes.Index(line, []byte{' '})
+	s2 := bytes.Index(line[s1+1:], []byte{' '})
+	if s1 < 0 || s2 < 0 {
+		return
+	}
+	s2 += s1 + 1
+	return string(line[:s1]), string(line[s1+1 : s2]), true
 }
